@@ -26,7 +26,7 @@ class RosstatPrices:
     diesel_barnaul: float
     source_url: str
     pdf_url: str
-    ssl_insecure_used: bool  # True если пришлось отключить проверку сертификата
+    ssl_insecure_used: bool
 
 
 _MONTHS_RU = {
@@ -94,14 +94,18 @@ def _get(session: requests.Session, url: str, timeout: int = 30, verify: bool = 
     return r
 
 
-def fetch_latest_prices() -> RosstatPrices:
+def fetch_latest_prices(as_of: date | None = None) -> RosstatPrices:
+    """
+    as_of:
+      если задано — берём самую позднюю публикацию, где date_state <= as_of
+      если None — берём самую свежую вообще
+    """
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FuelNCET/1.0",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
 
-    # Сначала пробуем безопасно verify=True, если не получится — повторяем verify=False
     verify = True
     ssl_insecure_used = False
 
@@ -110,7 +114,6 @@ def fetch_latest_prices() -> RosstatPrices:
         try:
             return _get(session, url, verify=verify)
         except SSLError:
-            # fallback: отключаем проверку сертификата
             verify = False
             ssl_insecure_used = True
             return _get(session, url, verify=verify)
@@ -120,25 +123,37 @@ def fetch_latest_prices() -> RosstatPrices:
     html = safe_get(news_url).text
     soup = BeautifulSoup(html, "lxml")
 
-    # 2) ссылки "Потребительские цены на ..."
+    # 2) кандидаты
     candidates: list[tuple[date, str]] = []
     for a in soup.find_all("a", href=True):
         text = (a.get_text() or "").strip()
         if "Потребительские цены на" not in text:
             continue
+
         d = _parse_date_from_title(text)
         if not d:
             continue
+
+        if as_of is not None and d > as_of:
+            # публикация "слишком новая" относительно даты формирования
+            continue
+
         candidates.append((d, a["href"]))
 
     if not candidates:
-        raise ValueError("Не найдены публикации 'Потребительские цены на ...' на странице /news_stat.")
+        msg = "Не найдены подходящие публикации 'Потребительские цены на ...'"
+        if as_of is not None:
+            msg += f" не позже {as_of.strftime('%d.%m.%Y')}."
+        else:
+            msg += "."
+        raise ValueError(msg)
 
+    # 3) самая свежая из подходящих
     candidates.sort(key=lambda x: x[0], reverse=True)
     date_state, href = candidates[0]
     doc_url = urljoin(BASE_URL, href)
 
-    # 3) страница документа
+    # 4) страница документа
     doc_html = safe_get(doc_url).text
     doc_soup = BeautifulSoup(doc_html, "lxml")
 
@@ -148,25 +163,23 @@ def fetch_latest_prices() -> RosstatPrices:
 
     pdf_url = urljoin(BASE_URL, altai_href)
 
-    # 4) скачиваем PDF (проверяем, что это реально PDF)
+    # 5) скачиваем PDF
     resp = safe_get(pdf_url)
     content = resp.content
     content_type = (resp.headers.get("Content-Type") or "").lower()
 
     if (not _looks_like_pdf(content)) and ("pdf" not in content_type):
-        snippet = content[:400]
-        snippet_text = snippet.decode("utf-8", errors="replace")
+        snippet = content[:400].decode("utf-8", errors="replace")
         raise ValueError(
             "Ссылка 'Алтайский край' вернула не PDF.\n"
             f"URL: {pdf_url}\n"
             f"Content-Type: {content_type}\n"
             "Первые символы ответа:\n"
-            f"{snippet_text}"
+            f"{snippet}"
         )
 
-    # 5) парсим PDF
+    # 6) парсим PDF
     ai92 = ai95 = diesel = None
-
     with pdfplumber.open(io.BytesIO(content)) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
@@ -185,8 +198,7 @@ def fetch_latest_prices() -> RosstatPrices:
 
     if ai92 is None or ai95 is None or diesel is None:
         raise ValueError(
-            "Не удалось извлечь все значения из PDF. "
-            "Возможно изменился формат PDF или строки перенеслись."
+            "Не удалось извлечь все значения из PDF. Возможно изменился формат PDF."
         )
 
     return RosstatPrices(

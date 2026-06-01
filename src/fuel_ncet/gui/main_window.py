@@ -21,7 +21,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Fuel NCET")
-        self.resize(1100, 740)
+        self.resize(1100, 780)
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -29,6 +29,13 @@ class MainWindow(QMainWindow):
 
         form = QFormLayout()
         layout.addLayout(form)
+
+        # NEW: дата формирования (подготовки обоснования)
+        self.date_doc = QDateEdit()
+        self.date_doc.setCalendarPopup(True)
+        self.date_doc.setDisplayFormat("dd.MM.yyyy")
+        self.date_doc.setDate(QDate.currentDate())
+        form.addRow("Дата формирования (подготовки):", self.date_doc)
 
         self.date_state = QDateEdit()
         self.date_state.setCalendarPopup(True)
@@ -85,7 +92,7 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         layout.addLayout(btn_row)
 
-        self.btn_fetch = QPushButton("Загрузить с Росстата")
+        self.btn_fetch = QPushButton("Загрузить с Росстата (по дате формирования)")
         self.btn_calc = QPushButton("Рассчитать")
         self.btn_export = QPushButton("Сохранить DOCX")
 
@@ -107,7 +114,6 @@ class MainWindow(QMainWindow):
         self.btn_calc.clicked.connect(self.on_calc)
         self.btn_export.clicked.connect(self.on_export_docx)
 
-        # будем хранить последний результат расчёта, чтобы экспортировать
         self._last_calc_out = None
         self._last_calc_inp = None
 
@@ -137,8 +143,12 @@ class MainWindow(QMainWindow):
             self.btn_fetch.setEnabled(False)
             self.btn_fetch.setText("Загрузка...")
 
-            data = fetch_latest_prices()
+            qd = self.date_doc.date()
+            as_of = dt_date(qd.year(), qd.month(), qd.day())
 
+            data = fetch_latest_prices(as_of=as_of)
+
+            # заполняем дату состояния и цены
             self.date_state.setDate(QDate(data.date_state.year, data.date_state.month, data.date_state.day))
             self.price_ai92.setText(f"{data.ai92_barnaul:.2f}".replace(".", ","))
             self.price_ai95.setText(f"{data.ai95_barnaul:.2f}".replace(".", ","))
@@ -148,15 +158,15 @@ class MainWindow(QMainWindow):
             warn = ""
             if getattr(data, "ssl_insecure_used", False):
                 warn = (
-                    "\n\nВнимание: на этом компьютере не прошла проверка SSL-сертификата, "
-                    "поэтому загрузка выполнена без проверки сертификата (verify=False)."
+                    "\n\nВнимание: SSL-сертификат не проверился, загрузка выполнена без проверки (verify=False)."
                 )
 
             QMessageBox.information(
                 self,
                 "Росстат",
                 "Данные загружены:\n"
-                f"Дата: {data.date_state.strftime('%d.%m.%Y')}\n"
+                f"Дата формирования: {as_of.strftime('%d.%m.%Y')}\n"
+                f"Дата состояния (выбрана): {data.date_state.strftime('%d.%m.%Y')}\n"
                 f"АИ-92 (Барнаул): {str(data.ai92_barnaul).replace('.', ',')}\n"
                 f"АИ-95 (Барнаул): {str(data.ai95_barnaul).replace('.', ',')}\n"
                 f"ДТ (Барнаул): {str(data.diesel_barnaul).replace('.', ',')}\n"
@@ -167,7 +177,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка загрузки", str(e))
         finally:
             self.btn_fetch.setEnabled(True)
-            self.btn_fetch.setText("Загрузить с Росстата")
+            self.btn_fetch.setText("Загрузить с Росстата (по дате формирования)")
 
     def on_calc(self):
         try:
@@ -177,8 +187,8 @@ class MainWindow(QMainWindow):
             qdate = self.date_state.date()
             base_month = qdate.month()
 
-            inflation_percent = parse_decimal_ru(self.inflation_percent.text())  # 104,0
-            inflation_factor = Decimal("1") + (inflation_percent - Decimal("100")) / Decimal("100")  # 1.040
+            inflation_percent = parse_decimal_ru(self.inflation_percent.text())
+            inflation_factor = Decimal("1") + (inflation_percent - Decimal("100")) / Decimal("100")
 
             inp = CalcInput(
                 base_month=base_month,
@@ -227,21 +237,14 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка", str(e))
 
     def _supply_period_by_rule(self, base_month: int, state_year: int):
-        """
-        По вашей логике:
-        - base_month < 6  -> поставка июль-декабрь state_year
-        - base_month > 9  -> поставка январь-июнь state_year+1
-        """
         if base_month < 6:
             return (7, state_year), (12, state_year)
         if base_month > 9:
             return (1, state_year + 1), (6, state_year + 1)
-        # для 6..9 оставляем как “не определено” (можно будет расширить при необходимости)
         raise ValueError("Для базового месяца июнь–сентябрь период поставки задайте вручную (пока не реализовано).")
 
     def on_export_docx(self):
         try:
-            # Проверим, что расчёт уже есть
             if self._last_calc_out is None or self._last_calc_inp is None:
                 QMessageBox.information(self, "Экспорт", "Сначала нажмите «Рассчитать».")
                 return
@@ -249,27 +252,26 @@ class MainWindow(QMainWindow):
             out = self._last_calc_out
             inp = self._last_calc_inp
 
-            # Максимальная цена контракта обязательна
             max_price_dec = parse_decimal_ru(self.max_contract_price.text())
 
-            # даты
-            qd = self.date_state.date()
-            date_state_py = dt_date(qd.year(), qd.month(), qd.day())
+            # дата состояния
+            qd_state = self.date_state.date()
+            date_state_py = dt_date(qd_state.year(), qd_state.month(), qd_state.day())
+
+            # дата формирования (идёт в документ)
+            qd_doc = self.date_doc.date()
+            doc_date_py = dt_date(qd_doc.year(), qd_doc.month(), qd_doc.day())
 
             (m_start, y_start), (m_end, y_end) = self._supply_period_by_rule(inp.base_month, date_state_py.year)
-
             inflation_year = y_start
-            today = dt_date.today()
 
-            # Деньги прописью
             total_words = money_to_words(out.total_sum)
             max_words = money_to_words(max_price_dec)
 
-            # Формат максимальной цены с пробелами тысяч: "748 876,00"
             max_price_str = f"{max_price_dec:,.2f}".replace(",", " ").replace(".", ",")
 
             inflation_percent_str = self.inflation_percent.text().strip()
-            inflation_factor_str = fmt_decimal(inp.inflation_year_factor, 3)  # 1,040
+            inflation_factor_str = fmt_decimal(inp.inflation_year_factor, 3)
 
             data = ExportData(
                 date_state=date_state_py.strftime("%d.%m.%Y"),
@@ -319,11 +321,11 @@ class MainWindow(QMainWindow):
                 supply_end_month_name=MONTHS_RU_NOM[m_end],
                 supply_end_year=str(y_end),
 
-                doc_date=today.strftime("%d.%m.%Y"),
+                doc_date=doc_date_py.strftime("%d.%m.%Y"),
             )
 
-            # диалог сохранения
-            default_name = f"Обоснование НМЦК от {today.strftime('%d.%m.%Y')}.docx"
+            # имя файла по дате формирования
+            default_name = f"Обоснование НМЦК от {doc_date_py.strftime('%d.%m.%Y')}.docx"
             path_str, _ = QFileDialog.getSaveFileName(
                 self,
                 "Сохранить DOCX",
