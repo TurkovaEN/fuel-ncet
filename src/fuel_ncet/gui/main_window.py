@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
 )
 
 from fuel_ncet.core.calc import CalcInput, calc
+from fuel_ncet.providers.rosstat import fetch_latest_prices
 from fuel_ncet.util.formatting import parse_decimal_ru, fmt_money, fmt_decimal
 
 
@@ -21,7 +22,6 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
 
-        # ---------- Form ----------
         form = QFormLayout()
         layout.addLayout(form)
 
@@ -50,7 +50,6 @@ class MainWindow(QMainWindow):
         self.inflation_percent.setPlaceholderText("например 104,0")
         form.addRow("Годовой индекс прогнозной инфляции, %:", self.inflation_percent)
 
-        # ---------- Degrees manual override ----------
         self.manual_degrees = QCheckBox("Править степени вручную (n_start, n_end)")
         layout.addWidget(self.manual_degrees)
 
@@ -74,7 +73,6 @@ class MainWindow(QMainWindow):
         self.manual_degrees.toggled.connect(self.n_start.setEnabled)
         self.manual_degrees.toggled.connect(self.n_end.setEnabled)
 
-        # ---------- Buttons ----------
         btn_row = QHBoxLayout()
         layout.addLayout(btn_row)
 
@@ -87,8 +85,6 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_export)
         btn_row.addStretch(1)
 
-        # ---------- Table preview ----------
-        # 4 строки товаров + 1 строка Итого
         self.table = QTableWidget(5, 7)
         self.table.setHorizontalHeaderLabels([
             "№", "Наименование товара", "Ед. изм.", "Кол-во",
@@ -98,13 +94,11 @@ class MainWindow(QMainWindow):
 
         self._fill_static_rows()
 
-        # Handlers
-        self.btn_fetch.clicked.connect(self._not_ready_fetch)
+        self.btn_fetch.clicked.connect(self.on_fetch_rosstat)
         self.btn_calc.clicked.connect(self.on_calc)
         self.btn_export.clicked.connect(self._not_ready_export)
 
     def _fill_static_rows(self):
-        # Сначала очистим и заново подготовим таблицу
         self.table.clearContents()
         self.table.setRowCount(5)
 
@@ -121,24 +115,58 @@ class MainWindow(QMainWindow):
             self.table.setItem(r, 2, QTableWidgetItem("Литр; кубический дециметр"))
             self.table.setItem(r, 3, QTableWidgetItem("1"))
 
-        # Строка "Итого" (последняя, индекс 4)
         total_row = 4
-        # Объединяем ячейки 0..5 в одну (6 ячеек)
         self.table.setSpan(total_row, 0, 1, 6)
         self.table.setItem(total_row, 0, QTableWidgetItem("Итого"))
-        # Колонка 6 (начальная сумма) будет заполняться после расчёта
+
+    def on_fetch_rosstat(self):
+        try:
+            self.btn_fetch.setEnabled(False)
+            self.btn_fetch.setText("Загрузка...")
+
+            data = fetch_latest_prices()
+
+            self.date_state.setDate(QDate(data.date_state.year, data.date_state.month, data.date_state.day))
+            self.price_ai92.setText(f"{data.ai92_barnaul:.2f}".replace(".", ","))
+            self.price_ai95.setText(f"{data.ai95_barnaul:.2f}".replace(".", ","))
+            self.price_dt_summer.setText(f"{data.diesel_barnaul:.2f}".replace(".", ","))
+            self.price_dt_winter.setText(f"{data.diesel_barnaul:.2f}".replace(".", ","))
+
+            warn = ""
+            if data.ssl_insecure_used:
+                warn = (
+                    "\n\nВнимание: на этом компьютере не прошла проверка SSL-сертификата, "
+                    "поэтому загрузка выполнена без проверки сертификата (verify=False)."
+                )
+
+            QMessageBox.information(
+                self,
+                "Росстат",
+                "Данные загружены:\n"
+                f"Дата: {data.date_state.strftime('%d.%m.%Y')}\n"
+                f"АИ-92 (Барнаул): {str(data.ai92_barnaul).replace('.', ',')}\n"
+                f"АИ-95 (Барнаул): {str(data.ai95_barnaul).replace('.', ',')}\n"
+                f"ДТ (Барнаул): {str(data.diesel_barnaul).replace('.', ',')}\n\n"
+                f"Страница: {data.source_url}"
+                f"{warn}"
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка загрузки", str(e))
+        finally:
+            self.btn_fetch.setEnabled(True)
+            self.btn_fetch.setText("Загрузить с Росстата")
 
     def on_calc(self):
         try:
-            # Если зима не заполнена — по умолчанию приравниваем к лету
             if not self.price_dt_winter.text().strip() and self.price_dt_summer.text().strip():
                 self.price_dt_winter.setText(self.price_dt_summer.text().strip())
 
             qdate = self.date_state.date()
             base_month = qdate.month()
 
-            inflation_percent = parse_decimal_ru(self.inflation_percent.text())  # 104,0
-            inflation_factor = Decimal("1") + (inflation_percent - Decimal("100")) / Decimal("100")  # 1.040
+            inflation_percent = parse_decimal_ru(self.inflation_percent.text())
+            inflation_factor = Decimal("1") + (inflation_percent - Decimal("100")) / Decimal("100")
 
             inp = CalcInput(
                 base_month=base_month,
@@ -154,7 +182,6 @@ class MainWindow(QMainWindow):
 
             out = calc(inp)
 
-            # если авто-режим, покажем рассчитанные степени в полях
             if not self.manual_degrees.isChecked():
                 self.n_start.setValue(out.n_start)
                 self.n_end.setValue(out.n_end)
@@ -162,15 +189,12 @@ class MainWindow(QMainWindow):
             prices = [inp.price_ai92, inp.price_ai95, inp.price_dt_summer, inp.price_dt_winter]
             sums = [out.sum_ai92, out.sum_ai95, out.sum_dt_summer, out.sum_dt_winter]
 
-            # строки 0..3 — товары
             for r in range(4):
                 self.table.setItem(r, 4, QTableWidgetItem(fmt_money(prices[r])))
                 self.table.setItem(r, 5, QTableWidgetItem(fmt_decimal(out.ipc_period, 2)))
                 self.table.setItem(r, 6, QTableWidgetItem(fmt_money(sums[r])))
 
-            # строка 4 — итого
-            total_row = 4
-            self.table.setItem(total_row, 6, QTableWidgetItem(fmt_money(out.total_sum)))
+            self.table.setItem(4, 6, QTableWidgetItem(fmt_money(out.total_sum)))
 
             QMessageBox.information(
                 self,
@@ -186,9 +210,6 @@ class MainWindow(QMainWindow):
 
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", str(e))
-
-    def _not_ready_fetch(self):
-        QMessageBox.information(self, "Инфо", "Загрузка с Росстата будет в следующем этапе.")
 
     def _not_ready_export(self):
         QMessageBox.information(self, "Инфо", "Экспорт DOCX будет в следующем этапе.")
