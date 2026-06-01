@@ -88,7 +88,8 @@ class MainWindow(QMainWindow):
         btn_row.addStretch(1)
 
         # ---------- Table preview ----------
-        self.table = QTableWidget(4, 7)
+        # 4 строки товаров + 1 строка Итого
+        self.table = QTableWidget(5, 7)
         self.table.setHorizontalHeaderLabels([
             "№", "Наименование товара", "Ед. изм.", "Кол-во",
             "Цена Росстат (Барнаул)", "ИПЦ", "Начальная сумма"
@@ -103,17 +104,29 @@ class MainWindow(QMainWindow):
         self.btn_export.clicked.connect(self._not_ready_export)
 
     def _fill_static_rows(self):
+        # Сначала очистим и заново подготовим таблицу
+        self.table.clearContents()
+        self.table.setRowCount(5)
+
         items = [
             (1, "Бензин автомобильный (розничная реализация) АИ-92"),
             (2, "Бензин автомобильный (розничная реализация) АИ-95"),
             (3, "Топливо дизельное (розничная реализация) (летний период)"),
             (4, "Топливо дизельное (розничная реализация) (зимний период)"),
         ]
+
         for r, (num, name) in enumerate(items):
             self.table.setItem(r, 0, QTableWidgetItem(str(num)))
             self.table.setItem(r, 1, QTableWidgetItem(name))
             self.table.setItem(r, 2, QTableWidgetItem("Литр; кубический дециметр"))
             self.table.setItem(r, 3, QTableWidgetItem("1"))
+
+        # Строка "Итого" (последняя, индекс 4)
+        total_row = 4
+        # Объединяем ячейки 0..5 в одну (6 ячеек)
+        self.table.setSpan(total_row, 0, 1, 6)
+        self.table.setItem(total_row, 0, QTableWidgetItem("Итого"))
+        # Колонка 6 (начальная сумма) будет заполняться после расчёта
 
     def on_calc(self):
         try:
@@ -149,10 +162,15 @@ class MainWindow(QMainWindow):
             prices = [inp.price_ai92, inp.price_ai95, inp.price_dt_summer, inp.price_dt_winter]
             sums = [out.sum_ai92, out.sum_ai95, out.sum_dt_summer, out.sum_dt_winter]
 
+            # строки 0..3 — товары
             for r in range(4):
                 self.table.setItem(r, 4, QTableWidgetItem(fmt_money(prices[r])))
                 self.table.setItem(r, 5, QTableWidgetItem(fmt_decimal(out.ipc_period, 2)))
                 self.table.setItem(r, 6, QTableWidgetItem(fmt_money(sums[r])))
+
+            # строка 4 — итого
+            total_row = 4
+            self.table.setItem(total_row, 6, QTableWidgetItem(fmt_money(out.total_sum)))
 
             QMessageBox.information(
                 self,
