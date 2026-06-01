@@ -1,9 +1,5 @@
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP, getcontext
-
-
-# повышаем точность, чтобы не было расхождений на 4-м знаке
-getcontext().prec = 50
+from decimal import Decimal, ROUND_HALF_UP
 
 
 @dataclass
@@ -21,12 +17,12 @@ class CalcInput:
 
 @dataclass
 class CalcOutput:
-    monthly_index: Decimal          # m (округлённый для отображения)
+    monthly_index: Decimal
     n_start: int
     n_end: int
-    deflator_start: Decimal         # d_start
-    deflator_end: Decimal           # d_end
-    ipc_period: Decimal             # ИПЦ на период поставки (среднее)
+    deflator_start: Decimal
+    deflator_end: Decimal
+    ipc_period: Decimal
     sum_ai92: Decimal
     sum_ai95: Decimal
     sum_dt_summer: Decimal
@@ -40,11 +36,8 @@ def _round(d: Decimal, places: int) -> Decimal:
 
 
 def compute_degrees_by_rule(base_month: int) -> tuple[int, int]:
-    """
-    Ваша логика:
-    - если base_month < 6  -> степени до июля и до декабря (текущий год)
-    - если base_month > 9  -> степени до января и до июня (следующий год)
-    """
+    # base_month < 6 -> до июля/декабря
+    # base_month > 9 -> до января/июня следующего года
     if base_month < 6:
         return 7 - base_month, 12 - base_month
     if base_month > 9:
@@ -57,25 +50,24 @@ def compute_degrees_by_rule(base_month: int) -> tuple[int, int]:
 
 
 def calc(inp: CalcInput) -> CalcOutput:
-    if inp.inflation_year_factor <= 0:
-        raise ValueError("Индекс прогнозной инфляции должен быть > 0")
-
-    # Точный ежемесячный индекс: m = exp( ln(factor) / 12 )
-    m_raw = (inp.inflation_year_factor.ln() / Decimal(12)).exp()
-
-    # monthly_index в выводе — округляем до 4 знаков, как в документе
-    m_display = _round(m_raw, 4)
+    # Ежемесячный индекс: m = factor^(1/12)
+    # ВАЖНО: округляем m до 4 знаков ДО возведения в степень (как в вашем прежнем варианте)
+    factor_f = float(inp.inflation_year_factor)
+    m = Decimal(str(factor_f ** (1.0 / 12.0)))
+    m = _round(m, 4)
 
     if inp.manual_degrees:
         n_start, n_end = inp.n_start, inp.n_end
     else:
         n_start, n_end = compute_degrees_by_rule(inp.base_month)
 
-    # дефляторы считаем от НЕокруглённого m_raw
-    d_start = _round(m_raw ** int(n_start), 4)
-    d_end = _round(m_raw ** int(n_end), 4)
+    defl_start = Decimal(str(float(m) ** n_start))
+    defl_end = Decimal(str(float(m) ** n_end))
+    defl_start = _round(defl_start, 4)
+    defl_end = _round(defl_end, 4)
 
-    ipc = _round((d_start + d_end) / Decimal("2"), 2)
+    ipc = (defl_start + defl_end) / Decimal("2")
+    ipc = _round(ipc, 2)
 
     s1 = _round(inp.price_ai92 * ipc, 2)
     s2 = _round(inp.price_ai95 * ipc, 2)
@@ -84,11 +76,11 @@ def calc(inp: CalcInput) -> CalcOutput:
     total = _round(s1 + s2 + s3 + s4, 2)
 
     return CalcOutput(
-        monthly_index=m_display,
+        monthly_index=m,
         n_start=n_start,
         n_end=n_end,
-        deflator_start=d_start,
-        deflator_end=d_end,
+        deflator_start=defl_start,
+        deflator_end=defl_end,
         ipc_period=ipc,
         sum_ai92=s1,
         sum_ai95=s2,
