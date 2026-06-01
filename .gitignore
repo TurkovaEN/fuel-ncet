@@ -1,0 +1,22 @@
+
+### `.gitignore`
+Создайте файл `.gitignore` и вставьте:
+```gitignore
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# PyCharm
+.idea/
+
+# Build
+build/
+dist/
+*.spec
+
+# Runtime
+cache/
+output/
+*.log

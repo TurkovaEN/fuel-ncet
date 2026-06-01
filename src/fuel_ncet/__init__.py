@@ -1,0 +1,1 @@
+print("Fuel NCET project scaffold")
