@@ -1,22 +1,27 @@
 from decimal import Decimal
+from datetime import date as dt_date
+from pathlib import Path
 
 from PySide6.QtCore import QDate
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTableWidget, QTableWidgetItem, QFormLayout,
-    QLineEdit, QDateEdit, QMessageBox, QCheckBox, QSpinBox, QLabel
+    QLineEdit, QDateEdit, QMessageBox, QCheckBox, QSpinBox, QLabel,
+    QFileDialog
 )
 
 from fuel_ncet.core.calc import CalcInput, calc
 from fuel_ncet.providers.rosstat import fetch_latest_prices
 from fuel_ncet.util.formatting import parse_decimal_ru, fmt_money, fmt_decimal
+from fuel_ncet.util.ru_money import money_to_words
+from fuel_ncet.export.docx_exporter import ExportData, export_docx, MONTHS_RU_NOM
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Fuel NCET")
-        self.resize(1100, 700)
+        self.resize(1100, 740)
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -49,6 +54,10 @@ class MainWindow(QMainWindow):
         self.inflation_percent = QLineEdit()
         self.inflation_percent.setPlaceholderText("например 104,0")
         form.addRow("Годовой индекс прогнозной инфляции, %:", self.inflation_percent)
+
+        self.max_contract_price = QLineEdit()
+        self.max_contract_price.setPlaceholderText("например 748 876,00")
+        form.addRow("Максимальное значение цены контракта, руб:", self.max_contract_price)
 
         self.manual_degrees = QCheckBox("Править степени вручную (n_start, n_end)")
         layout.addWidget(self.manual_degrees)
@@ -96,7 +105,11 @@ class MainWindow(QMainWindow):
 
         self.btn_fetch.clicked.connect(self.on_fetch_rosstat)
         self.btn_calc.clicked.connect(self.on_calc)
-        self.btn_export.clicked.connect(self._not_ready_export)
+        self.btn_export.clicked.connect(self.on_export_docx)
+
+        # будем хранить последний результат расчёта, чтобы экспортировать
+        self._last_calc_out = None
+        self._last_calc_inp = None
 
     def _fill_static_rows(self):
         self.table.clearContents()
@@ -133,7 +146,7 @@ class MainWindow(QMainWindow):
             self.price_dt_winter.setText(f"{data.diesel_barnaul:.2f}".replace(".", ","))
 
             warn = ""
-            if data.ssl_insecure_used:
+            if getattr(data, "ssl_insecure_used", False):
                 warn = (
                     "\n\nВнимание: на этом компьютере не прошла проверка SSL-сертификата, "
                     "поэтому загрузка выполнена без проверки сертификата (verify=False)."
@@ -146,8 +159,7 @@ class MainWindow(QMainWindow):
                 f"Дата: {data.date_state.strftime('%d.%m.%Y')}\n"
                 f"АИ-92 (Барнаул): {str(data.ai92_barnaul).replace('.', ',')}\n"
                 f"АИ-95 (Барнаул): {str(data.ai95_barnaul).replace('.', ',')}\n"
-                f"ДТ (Барнаул): {str(data.diesel_barnaul).replace('.', ',')}\n\n"
-                f"Страница: {data.source_url}"
+                f"ДТ (Барнаул): {str(data.diesel_barnaul).replace('.', ',')}\n"
                 f"{warn}"
             )
 
@@ -165,8 +177,8 @@ class MainWindow(QMainWindow):
             qdate = self.date_state.date()
             base_month = qdate.month()
 
-            inflation_percent = parse_decimal_ru(self.inflation_percent.text())
-            inflation_factor = Decimal("1") + (inflation_percent - Decimal("100")) / Decimal("100")
+            inflation_percent = parse_decimal_ru(self.inflation_percent.text())  # 104,0
+            inflation_factor = Decimal("1") + (inflation_percent - Decimal("100")) / Decimal("100")  # 1.040
 
             inp = CalcInput(
                 base_month=base_month,
@@ -196,6 +208,9 @@ class MainWindow(QMainWindow):
 
             self.table.setItem(4, 6, QTableWidgetItem(fmt_money(out.total_sum)))
 
+            self._last_calc_out = out
+            self._last_calc_inp = inp
+
             QMessageBox.information(
                 self,
                 "Расчёт выполнен",
@@ -211,5 +226,115 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", str(e))
 
-    def _not_ready_export(self):
-        QMessageBox.information(self, "Инфо", "Экспорт DOCX будет в следующем этапе.")
+    def _supply_period_by_rule(self, base_month: int, state_year: int):
+        """
+        По вашей логике:
+        - base_month < 6  -> поставка июль-декабрь state_year
+        - base_month > 9  -> поставка январь-июнь state_year+1
+        """
+        if base_month < 6:
+            return (7, state_year), (12, state_year)
+        if base_month > 9:
+            return (1, state_year + 1), (6, state_year + 1)
+        # для 6..9 оставляем как “не определено” (можно будет расширить при необходимости)
+        raise ValueError("Для базового месяца июнь–сентябрь период поставки задайте вручную (пока не реализовано).")
+
+    def on_export_docx(self):
+        try:
+            # Проверим, что расчёт уже есть
+            if self._last_calc_out is None or self._last_calc_inp is None:
+                QMessageBox.information(self, "Экспорт", "Сначала нажмите «Рассчитать».")
+                return
+
+            out = self._last_calc_out
+            inp = self._last_calc_inp
+
+            # Максимальная цена контракта обязательна
+            max_price_dec = parse_decimal_ru(self.max_contract_price.text())
+
+            # даты
+            qd = self.date_state.date()
+            date_state_py = dt_date(qd.year(), qd.month(), qd.day())
+
+            (m_start, y_start), (m_end, y_end) = self._supply_period_by_rule(inp.base_month, date_state_py.year)
+
+            inflation_year = y_start
+            today = dt_date.today()
+
+            # Деньги прописью
+            total_words = money_to_words(out.total_sum)
+            max_words = money_to_words(max_price_dec)
+
+            # Формат максимальной цены с пробелами тысяч: "748 876,00"
+            max_price_str = f"{max_price_dec:,.2f}".replace(",", " ").replace(".", ",")
+
+            inflation_percent_str = self.inflation_percent.text().strip()
+            inflation_factor_str = fmt_decimal(inp.inflation_year_factor, 3)  # 1,040
+
+            data = ExportData(
+                date_state=date_state_py.strftime("%d.%m.%Y"),
+
+                inflation_year_percent=inflation_percent_str,
+                inflation_year=str(inflation_year),
+                inflation_year_next1=str(inflation_year + 1),
+                inflation_year_next2=str(inflation_year + 2),
+
+                inflation_year_factor=inflation_factor_str,
+                monthly_index=fmt_decimal(out.monthly_index, 4),
+
+                n_start=out.n_start,
+                n_end=out.n_end,
+
+                deflator_start=fmt_decimal(out.deflator_start, 4),
+                deflator_end=fmt_decimal(out.deflator_end, 4),
+
+                ipc_period=fmt_decimal(out.ipc_period, 2),
+
+                price_ai92=fmt_money(inp.price_ai92),
+                price_ai95=fmt_money(inp.price_ai95),
+                price_dt_summer=fmt_money(inp.price_dt_summer),
+                price_dt_winter=fmt_money(inp.price_dt_winter),
+
+                sum_ai92=fmt_money(out.sum_ai92),
+                sum_ai95=fmt_money(out.sum_ai95),
+                sum_dt_summer=fmt_money(out.sum_dt_summer),
+                sum_dt_winter=fmt_money(out.sum_dt_winter),
+
+                total_sum=fmt_money(out.total_sum),
+                total_rub=str(total_words.rub),
+                total_kop=f"{total_words.kop:02d}",
+                total_rub_words=total_words.rub_words,
+                total_kop_words=total_words.kop_words,
+                total_rub_word=total_words.rub_word,
+                total_kop_word=total_words.kop_word,
+
+                max_contract_price=max_price_str,
+                max_contract_rub_words=max_words.rub_words,
+                max_contract_rub_word=max_words.rub_word,
+                max_contract_kop=f"{max_words.kop:02d}",
+                max_contract_kop_word=max_words.kop_word,
+
+                supply_start_month_name=MONTHS_RU_NOM[m_start],
+                supply_start_year=str(y_start),
+                supply_end_month_name=MONTHS_RU_NOM[m_end],
+                supply_end_year=str(y_end),
+
+                doc_date=today.strftime("%d.%m.%Y"),
+            )
+
+            # диалог сохранения
+            default_name = f"Обоснование НМЦК от {today.strftime('%d.%m.%Y')}.docx"
+            path_str, _ = QFileDialog.getSaveFileName(
+                self,
+                "Сохранить DOCX",
+                str(Path.home() / default_name),
+                "Word document (*.docx)"
+            )
+            if not path_str:
+                return
+
+            export_docx(data, Path(path_str))
+            QMessageBox.information(self, "Экспорт", f"Файл сохранён:\n{path_str}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка экспорта", str(e))
