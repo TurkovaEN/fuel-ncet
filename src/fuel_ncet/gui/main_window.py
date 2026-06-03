@@ -3,7 +3,8 @@ from datetime import date as dt_date
 from pathlib import Path
 import shutil
 
-from PySide6.QtCore import QDate, QObject, QThread, Signal
+from PySide6.QtCore import QDate, QObject, QThread, Signal, QRegularExpression
+from PySide6.QtGui import QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTableWidget, QTableWidgetItem, QFormLayout,
@@ -17,6 +18,10 @@ from fuel_ncet.util.app_paths import get_cache_dir
 from fuel_ncet.util.formatting import parse_decimal_ru, fmt_money, fmt_decimal
 from fuel_ncet.util.ru_money import money_to_words
 from fuel_ncet.export.docx_exporter import ExportData, export_docx, MONTHS_RU_NOM
+
+
+INVALID_STYLE = "border: 2px solid #cc0000;"
+VALID_STYLE = ""
 
 
 class RosstatWorker(QObject):
@@ -44,7 +49,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Fuel NCET")
-        self.resize(1120, 840)
+        self.resize(1120, 860)
 
         self.cache_dir = get_cache_dir()
 
@@ -131,7 +136,6 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_export)
         btn_row.addStretch(1)
 
-        # Статус
         self.lbl_status = QLabel("")
         layout.addWidget(self.lbl_status)
 
@@ -144,6 +148,10 @@ class MainWindow(QMainWindow):
 
         self._fill_static_rows()
 
+        # Валидация + форматирование
+        self._setup_validators()
+
+        # handlers
         self.btn_fetch.clicked.connect(self.on_fetch_rosstat)
         self.btn_reset.clicked.connect(self.on_reset)
         self.btn_calc.clicked.connect(self.on_calc)
@@ -155,6 +163,152 @@ class MainWindow(QMainWindow):
         self._rosstat_thread: QThread | None = None
         self._rosstat_worker: RosstatWorker | None = None
 
+    # ------------------- validation helpers -------------------
+    def _mark_valid(self, w: QLineEdit):
+        w.setStyleSheet(VALID_STYLE)
+
+    def _mark_invalid(self, w: QLineEdit):
+        w.setStyleSheet(INVALID_STYLE)
+
+    def _setup_validators(self):
+        # Цена: цифры + (запятая/точка) + до 2 знаков
+        rx_money = QRegularExpression(r"^\d+(?:[,.]\d{0,2})?$")
+        v_money = QRegularExpressionValidator(rx_money, self)
+
+        # ИПЦ (%): цифры + (запятая/точка) + до 2 знаков (потом форматируем до 1)
+        rx_percent = QRegularExpression(r"^\d+(?:[,.]\d{0,2})?$")
+        v_percent = QRegularExpressionValidator(rx_percent, self)
+
+        # Макс. цена: разрешаем пробелы как разделитель тысяч
+        # примеры: 748 876,00 / 748876,00 / 748876
+        rx_max = QRegularExpression(r"^(?:\d{1,3}(?: \d{3})+|\d+)(?:[,.]\d{0,2})?$")
+        v_max = QRegularExpressionValidator(rx_max, self)
+
+        for w in (self.price_ai92, self.price_ai95, self.price_dt_summer, self.price_dt_winter):
+            w.setValidator(v_money)
+            w.textChanged.connect(lambda _=None, ww=w: self._mark_valid(ww))
+            w.editingFinished.connect(lambda ww=w: self._format_money_field(ww, decimals=2, group=False))
+
+        self.inflation_percent.setValidator(v_percent)
+        self.inflation_percent.textChanged.connect(lambda _=None: self._mark_valid(self.inflation_percent))
+        self.inflation_percent.editingFinished.connect(self._format_percent_field)
+
+        self.max_contract_price.setValidator(v_max)
+        self.max_contract_price.textChanged.connect(lambda _=None: self._mark_valid(self.max_contract_price))
+        self.max_contract_price.editingFinished.connect(self._format_max_contract_field)
+
+    def _format_money_field(self, w: QLineEdit, decimals: int = 2, group: bool = False):
+        t = w.text().strip()
+        if not t:
+            return
+        try:
+            val = parse_decimal_ru(t)
+            if val < 0:
+                raise ValueError("Число не может быть отрицательным")
+            if group:
+                # 748 876,00
+                s = f"{val:,.{decimals}f}".replace(",", " ").replace(".", ",")
+            else:
+                s = f"{val:.{decimals}f}".replace(".", ",")
+            w.setText(s)
+            self._mark_valid(w)
+        except Exception:
+            self._mark_invalid(w)
+
+    def _format_percent_field(self):
+        t = self.inflation_percent.text().strip()
+        if not t:
+            return
+        try:
+            val = parse_decimal_ru(t)
+            if val <= 0:
+                raise ValueError("ИПЦ должен быть > 0")
+            # формат до 1 знака: 104,0
+            s = f"{val:.1f}".replace(".", ",")
+            self.inflation_percent.setText(s)
+            self._mark_valid(self.inflation_percent)
+        except Exception:
+            self._mark_invalid(self.inflation_percent)
+
+    def _format_max_contract_field(self):
+        self._format_money_field(self.max_contract_price, decimals=2, group=True)
+
+    def _collect_required_decimals_for_calc(self):
+        """
+        Возвращает словарь значений или None (если есть ошибки).
+        Подсвечивает поля с ошибками.
+        """
+        errors = []
+
+        def need(w: QLineEdit, title: str) -> Decimal | None:
+            txt = w.text().strip()
+            if not txt:
+                self._mark_invalid(w)
+                errors.append(f"{title} (пусто)")
+                return None
+            try:
+                v = parse_decimal_ru(txt)
+                if v < 0:
+                    raise ValueError()
+                self._mark_valid(w)
+                return v
+            except Exception:
+                self._mark_invalid(w)
+                errors.append(f"{title} (неверный формат)")
+                return None
+
+        vals = {
+            "ai92": need(self.price_ai92, "АИ-92"),
+            "ai95": need(self.price_ai95, "АИ-95"),
+            "dt_s": need(self.price_dt_summer, "ДТ лето"),
+            "dt_w": need(self.price_dt_winter, "ДТ зима"),
+            "infl": need(self.inflation_percent, "ИПЦ (годовой индекс, %)"),
+        }
+
+        if any(v is None for v in vals.values()):
+            QMessageBox.critical(
+                self,
+                "Ошибка ввода",
+                "Исправьте поля:\n- " + "\n- ".join(errors)
+            )
+            return None
+
+        return vals  # type: ignore[return-value]
+
+    def _collect_required_decimals_for_export(self):
+        """
+        Для экспорта дополнительно нужна максимальная цена контракта.
+        """
+        errors = []
+
+        def need(w: QLineEdit, title: str) -> Decimal | None:
+            txt = w.text().strip()
+            if not txt:
+                self._mark_invalid(w)
+                errors.append(f"{title} (пусто)")
+                return None
+            try:
+                v = parse_decimal_ru(txt)
+                if v < 0:
+                    raise ValueError()
+                self._mark_valid(w)
+                return v
+            except Exception:
+                self._mark_invalid(w)
+                errors.append(f"{title} (неверный формат)")
+                return None
+
+        max_price = need(self.max_contract_price, "Максимальная цена контракта")
+        if max_price is None:
+            QMessageBox.critical(
+                self,
+                "Ошибка ввода",
+                "Исправьте поля:\n- " + "\n- ".join(errors)
+            )
+            return None
+        return max_price
+
+    # ------------------- window / caching -------------------
     def closeEvent(self, event):
         if self._rosstat_thread is not None and self._rosstat_thread.isRunning():
             self._rosstat_thread.quit()
@@ -174,7 +328,6 @@ class MainWindow(QMainWindow):
         self.btn_reset.setEnabled(not busy)
         self.btn_calc.setEnabled(not busy)
         self.btn_export.setEnabled(not busy)
-
         self.btn_fetch.setText("Загрузка..." if busy else "Загрузить с Росстата (по дате формирования)")
 
     def _fill_static_rows(self):
@@ -203,12 +356,12 @@ class MainWindow(QMainWindow):
         self.date_doc.setDate(today)
         self.date_state.setDate(today)
 
-        self.price_ai92.clear()
-        self.price_ai95.clear()
-        self.price_dt_summer.clear()
-        self.price_dt_winter.clear()
-        self.inflation_percent.clear()
-        self.max_contract_price.clear()
+        for w in (
+            self.price_ai92, self.price_ai95, self.price_dt_summer, self.price_dt_winter,
+            self.inflation_percent, self.max_contract_price
+        ):
+            w.clear()
+            self._mark_valid(w)
 
         self.manual_degrees.setChecked(False)
         self.n_start.setValue(0)
@@ -251,6 +404,10 @@ class MainWindow(QMainWindow):
         self.price_dt_summer.setText(f"{data.diesel_barnaul:.2f}".replace(".", ","))
         self.price_dt_winter.setText(f"{data.diesel_barnaul:.2f}".replace(".", ","))
 
+        # автоформатируем (на всякий случай)
+        for w in (self.price_ai92, self.price_ai95, self.price_dt_summer, self.price_dt_winter):
+            self._format_money_field(w, decimals=2, group=False)
+
         ssl_insecure = bool(getattr(data, "ssl_insecure_used", False))
         if ssl_insecure:
             self.lbl_status.setText(f"Росстат загружен: {data.date_state.strftime('%d.%m.%Y')} (SSL без проверки)")
@@ -275,22 +432,28 @@ class MainWindow(QMainWindow):
     # -------- CALC / EXPORT --------
     def on_calc(self):
         try:
-            if not self.price_dt_winter.text().strip() and self.price_dt_summer.text().strip():
-                self.price_dt_winter.setText(self.price_dt_summer.text().strip())
+            # форматируем перед расчётом
+            for w in (self.price_ai92, self.price_ai95, self.price_dt_summer, self.price_dt_winter):
+                self._format_money_field(w, decimals=2, group=False)
+            self._format_percent_field()
+
+            vals = self._collect_required_decimals_for_calc()
+            if vals is None:
+                return
 
             qdate = self.date_state.date()
             base_month = qdate.month()
 
-            inflation_percent = parse_decimal_ru(self.inflation_percent.text())
+            inflation_percent = vals["infl"]
             inflation_factor = Decimal("1") + (inflation_percent - Decimal("100")) / Decimal("100")
 
             inp = CalcInput(
                 base_month=base_month,
                 inflation_year_factor=inflation_factor,
-                price_ai92=parse_decimal_ru(self.price_ai92.text()),
-                price_ai95=parse_decimal_ru(self.price_ai95.text()),
-                price_dt_summer=parse_decimal_ru(self.price_dt_summer.text()),
-                price_dt_winter=parse_decimal_ru(self.price_dt_winter.text()),
+                price_ai92=vals["ai92"],
+                price_ai95=vals["ai95"],
+                price_dt_summer=vals["dt_s"],
+                price_dt_winter=vals["dt_w"],
                 manual_degrees=self.manual_degrees.isChecked(),
                 n_start=int(self.n_start.value()),
                 n_end=int(self.n_end.value()),
@@ -339,14 +502,18 @@ class MainWindow(QMainWindow):
 
     def on_export_docx(self):
         try:
+            # перед экспортом форматируем
+            self._format_max_contract_field()
+            max_price_dec = self._collect_required_decimals_for_export()
+            if max_price_dec is None:
+                return
+
             if self._last_calc_out is None or self._last_calc_inp is None:
                 QMessageBox.information(self, "Экспорт", "Сначала нажмите «Рассчитать».")
                 return
 
             out = self._last_calc_out
             inp = self._last_calc_inp
-
-            max_price_dec = parse_decimal_ru(self.max_contract_price.text())
 
             qd_state = self.date_state.date()
             date_state_py = dt_date(qd_state.year(), qd_state.month(), qd_state.day())
