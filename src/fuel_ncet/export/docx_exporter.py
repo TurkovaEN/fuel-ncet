@@ -1,15 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
-from decimal import Decimal
 from pathlib import Path
 import sys
 
 from docxtpl import DocxTemplate
-
-from fuel_ncet.util.formatting import fmt_money, fmt_decimal
-from fuel_ncet.util.ru_money import money_to_words
 
 
 MONTHS_RU_NOM = {
@@ -30,27 +25,36 @@ MONTHS_RU_NOM = {
 
 def _resource_path(rel: str) -> Path:
     """
-    Чтобы работало и в PyCharm, и в .exe (PyInstaller).
+    Чтобы работало и в PyCharm, и в .exe (PyInstaller onefile).
     """
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         base = Path(sys._MEIPASS)  # type: ignore[attr-defined]
     else:
-        base = Path(__file__).resolve().parents[3]  # .../src/fuel_ncet/export -> корень проекта
+        base = Path(__file__).resolve().parents[3]  # корень проекта
     return base / rel
 
 
 @dataclass
 class ExportData:
-    date_state: date
-    inflation_year_percent: str          # '104,0'
-    inflation_year_factor: str           # '1,040'
-    monthly_index: str                   # '1,0033'
+    # даты
+    date_state: str
+    doc_date: str
+
+    # инфляция
+    inflation_year_percent: str
+    inflation_year_factor: str
+    inflation_year: str
+    inflation_year_next1: str
+    inflation_year_next2: str
+
+    monthly_index: str
     n_start: int
     n_end: int
-    deflator_start: str                  # '1,0099'
-    deflator_end: str                    # '1,0264'
-    ipc_period: str                      # '1,02'
+    deflator_start: str
+    deflator_end: str
+    ipc_period: str
 
+    # цены и суммы
     price_ai92: str
     price_ai95: str
     price_dt_summer: str
@@ -61,36 +65,33 @@ class ExportData:
     sum_dt_summer: str
     sum_dt_winter: str
 
-    total_sum: str                       # '283,90'
-    total_rub: str                       # '283'
-    total_kop: str                       # '90'
-    total_rub_words: str                 # 'двести ...'
-    total_kop_words: str                 # 'девяносто'
-    total_rub_word: str                  # 'рубля'
-    total_kop_word: str                  # 'копеек'
+    total_sum: str  # для таблицы "Итого" (с копейками)
 
-    max_contract_price: str              # '748 876,00'
+    # прописью для "Начальная сумма..." (целые рубли + копейки)
+    total_rub: str
+    total_kop: str
+    total_rub_words: str
+    total_kop_words: str
+    total_rub_word: str
+    total_kop_word: str
+
+    # максимальная цена контракта (целые рубли + копейки + пропись)
+    max_contract_price: str  # можно оставить для других мест шаблона
+    max_contract_rub: str    # ВАЖНО: целые рубли для строки "Максимальное значение..."
     max_contract_rub_words: str
     max_contract_rub_word: str
     max_contract_kop: str
     max_contract_kop_word: str
 
+    # период поставки (для текста)
     supply_start_month_name: str
     supply_start_year: str
     supply_end_month_name: str
     supply_end_year: str
 
-    inflation_year: str
-    inflation_year_next1: str
-    inflation_year_next2: str
-
-    doc_date: str                        # системная дата '10.04.2026'
-
 
 def export_docx(data: ExportData, out_path: Path) -> None:
     template_path = _resource_path("assets/template.docx")
     doc = DocxTemplate(str(template_path))
-
-    context = data.__dict__
-    doc.render(context)
+    doc.render(data.__dict__)
     doc.save(str(out_path))

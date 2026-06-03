@@ -234,10 +234,6 @@ class MainWindow(QMainWindow):
         self._format_money_field(self.max_contract_price, decimals=2, group=True)
 
     def _collect_required_decimals_for_calc(self):
-        """
-        Возвращает словарь значений или None (если есть ошибки).
-        Подсвечивает поля с ошибками.
-        """
         errors = []
 
         def need(w: QLineEdit, title: str) -> Decimal | None:
@@ -276,9 +272,6 @@ class MainWindow(QMainWindow):
         return vals  # type: ignore[return-value]
 
     def _collect_required_decimals_for_export(self):
-        """
-        Для экспорта дополнительно нужна максимальная цена контракта.
-        """
         errors = []
 
         def need(w: QLineEdit, title: str) -> Decimal | None:
@@ -404,7 +397,6 @@ class MainWindow(QMainWindow):
         self.price_dt_summer.setText(f"{data.diesel_barnaul:.2f}".replace(".", ","))
         self.price_dt_winter.setText(f"{data.diesel_barnaul:.2f}".replace(".", ","))
 
-        # автоформатируем (на всякий случай)
         for w in (self.price_ai92, self.price_ai95, self.price_dt_summer, self.price_dt_winter):
             self._format_money_field(w, decimals=2, group=False)
 
@@ -432,7 +424,6 @@ class MainWindow(QMainWindow):
     # -------- CALC / EXPORT --------
     def on_calc(self):
         try:
-            # форматируем перед расчётом
             for w in (self.price_ai92, self.price_ai95, self.price_dt_summer, self.price_dt_winter):
                 self._format_money_field(w, decimals=2, group=False)
             self._format_percent_field()
@@ -502,7 +493,6 @@ class MainWindow(QMainWindow):
 
     def on_export_docx(self):
         try:
-            # перед экспортом форматируем
             self._format_max_contract_field()
             max_price_dec = self._collect_required_decimals_for_export()
             if max_price_dec is None:
@@ -527,12 +517,16 @@ class MainWindow(QMainWindow):
             total_words = money_to_words(out.total_sum)
             max_words = money_to_words(max_price_dec)
 
+            # "748 876,00"
             max_price_str = f"{max_price_dec:,.2f}".replace(",", " ").replace(".", ",")
+            # "748 876" (целые рубли)
+            max_contract_rub_str = f"{max_words.rub:,}".replace(",", " ")
 
             inflation_percent_str = self.inflation_percent.text().strip()
             inflation_factor_str = fmt_decimal(inp.inflation_year_factor, 3)
 
-            data = ExportData(
+            # Собираем контекст как dict, потом фильтруем под реальные поля ExportData
+            ctx = dict(
                 date_state=date_state_py.strftime("%d.%m.%Y"),
 
                 inflation_year_percent=inflation_percent_str,
@@ -569,7 +563,11 @@ class MainWindow(QMainWindow):
                 total_rub_word=total_words.rub_word,
                 total_kop_word=total_words.kop_word,
 
+                # оставляем и полное значение, если оно где-то нужно
                 max_contract_price=max_price_str,
+                # НОВОЕ: целые рубли (для строки "Максимальное значение цены контракта: 748 876 (...) ...")
+                max_contract_rub=max_contract_rub_str,
+
                 max_contract_rub_words=max_words.rub_words,
                 max_contract_rub_word=max_words.rub_word,
                 max_contract_kop=f"{max_words.kop:02d}",
@@ -582,6 +580,12 @@ class MainWindow(QMainWindow):
 
                 doc_date=doc_date_py.strftime("%d.%m.%Y"),
             )
+
+            # Фильтруем под актуальные поля ExportData (чтобы не падать, если поле ещё не добавлено)
+            allowed = set(getattr(ExportData, "__dataclass_fields__", {}).keys())
+            filtered = {k: v for k, v in ctx.items() if k in allowed}
+
+            data = ExportData(**filtered)
 
             default_name = f"Обоснование НМЦК от {doc_date_py.strftime('%d.%m.%Y')}.docx"
             path_str, _ = QFileDialog.getSaveFileName(
