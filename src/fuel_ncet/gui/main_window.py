@@ -1,6 +1,7 @@
 from decimal import Decimal
 from datetime import date as dt_date
 from pathlib import Path
+import shutil
 
 from PySide6.QtCore import QDate
 from PySide6.QtWidgets import (
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
 
 from fuel_ncet.core.calc import CalcInput, calc
 from fuel_ncet.providers.rosstat import fetch_latest_prices
+from fuel_ncet.util.app_paths import get_cache_dir
 from fuel_ncet.util.formatting import parse_decimal_ru, fmt_money, fmt_decimal
 from fuel_ncet.util.ru_money import money_to_words
 from fuel_ncet.export.docx_exporter import ExportData, export_docx, MONTHS_RU_NOM
@@ -21,7 +23,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Fuel NCET")
-        self.resize(1100, 780)
+        self.resize(1120, 820)
+
+        self.cache_dir = get_cache_dir()
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -30,13 +34,14 @@ class MainWindow(QMainWindow):
         form = QFormLayout()
         layout.addLayout(form)
 
-        # NEW: дата формирования (подготовки обоснования)
+        # Дата формирования
         self.date_doc = QDateEdit()
         self.date_doc.setCalendarPopup(True)
         self.date_doc.setDisplayFormat("dd.MM.yyyy")
         self.date_doc.setDate(QDate.currentDate())
         form.addRow("Дата формирования (подготовки):", self.date_doc)
 
+        # Дата состояния Росстат
         self.date_state = QDateEdit()
         self.date_state.setCalendarPopup(True)
         self.date_state.setDisplayFormat("dd.MM.yyyy")
@@ -58,6 +63,7 @@ class MainWindow(QMainWindow):
         form.addRow("ДТ лето (Барнаул), руб:", self.price_dt_summer)
         form.addRow("ДТ зима (Барнаул), руб:", self.price_dt_winter)
 
+        # ИПЦ вручную
         self.inflation_percent = QLineEdit()
         self.inflation_percent.setPlaceholderText("например 104,0")
         form.addRow("Годовой индекс прогнозной инфляции, %:", self.inflation_percent)
@@ -66,6 +72,12 @@ class MainWindow(QMainWindow):
         self.max_contract_price.setPlaceholderText("например 748 876,00")
         form.addRow("Максимальное значение цены контракта, руб:", self.max_contract_price)
 
+        # Галочка очистки кэша
+        self.chk_clear_cache = QCheckBox("Очищать кэш при выходе")
+        self.chk_clear_cache.setChecked(True)
+        layout.addWidget(self.chk_clear_cache)
+
+        # Ручные степени
         self.manual_degrees = QCheckBox("Править степени вручную (n_start, n_end)")
         layout.addWidget(self.manual_degrees)
 
@@ -89,18 +101,22 @@ class MainWindow(QMainWindow):
         self.manual_degrees.toggled.connect(self.n_start.setEnabled)
         self.manual_degrees.toggled.connect(self.n_end.setEnabled)
 
+        # Кнопки
         btn_row = QHBoxLayout()
         layout.addLayout(btn_row)
 
         self.btn_fetch = QPushButton("Загрузить с Росстата (по дате формирования)")
+        self.btn_reset = QPushButton("Сброс")
         self.btn_calc = QPushButton("Рассчитать")
         self.btn_export = QPushButton("Сохранить DOCX")
 
         btn_row.addWidget(self.btn_fetch)
+        btn_row.addWidget(self.btn_reset)
         btn_row.addWidget(self.btn_calc)
         btn_row.addWidget(self.btn_export)
         btn_row.addStretch(1)
 
+        # Таблица предпросмотра
         self.table = QTableWidget(5, 7)
         self.table.setHorizontalHeaderLabels([
             "№", "Наименование товара", "Ед. изм.", "Кол-во",
@@ -110,12 +126,24 @@ class MainWindow(QMainWindow):
 
         self._fill_static_rows()
 
+        # handlers
         self.btn_fetch.clicked.connect(self.on_fetch_rosstat)
+        self.btn_reset.clicked.connect(self.on_reset)
         self.btn_calc.clicked.connect(self.on_calc)
         self.btn_export.clicked.connect(self.on_export_docx)
 
         self._last_calc_out = None
         self._last_calc_inp = None
+
+    def closeEvent(self, event):
+        # удаляем кэш при выходе (если включено)
+        if self.chk_clear_cache.isChecked():
+            try:
+                if self.cache_dir.exists():
+                    shutil.rmtree(self.cache_dir, ignore_errors=True)
+            except Exception:
+                pass
+        super().closeEvent(event)
 
     def _fill_static_rows(self):
         self.table.clearContents()
@@ -138,6 +166,32 @@ class MainWindow(QMainWindow):
         self.table.setSpan(total_row, 0, 1, 6)
         self.table.setItem(total_row, 0, QTableWidgetItem("Итого"))
 
+    def on_reset(self):
+        # Даты: как в “стартовом” состоянии
+        today = QDate.currentDate()
+        self.date_doc.setDate(today)
+        self.date_state.setDate(today)
+
+        # Поля: очистить
+        self.price_ai92.clear()
+        self.price_ai95.clear()
+        self.price_dt_summer.clear()
+        self.price_dt_winter.clear()
+        self.inflation_percent.clear()
+        self.max_contract_price.clear()
+
+        # Степени: сброс
+        self.manual_degrees.setChecked(False)
+        self.n_start.setValue(0)
+        self.n_end.setValue(0)
+
+        # Таблица: очистить рассчитанные колонки
+        self._fill_static_rows()
+
+        # Сброс последнего расчёта
+        self._last_calc_out = None
+        self._last_calc_inp = None
+
     def on_fetch_rosstat(self):
         try:
             self.btn_fetch.setEnabled(False)
@@ -146,17 +200,17 @@ class MainWindow(QMainWindow):
             qd = self.date_doc.date()
             as_of = dt_date(qd.year(), qd.month(), qd.day())
 
-            data = fetch_latest_prices(as_of=as_of)
+            data = fetch_latest_prices(as_of=as_of, cache_dir=self.cache_dir)
 
-            # заполняем дату состояния и цены
             self.date_state.setDate(QDate(data.date_state.year, data.date_state.month, data.date_state.day))
+
             self.price_ai92.setText(f"{data.ai92_barnaul:.2f}".replace(".", ","))
             self.price_ai95.setText(f"{data.ai95_barnaul:.2f}".replace(".", ","))
             self.price_dt_summer.setText(f"{data.diesel_barnaul:.2f}".replace(".", ","))
             self.price_dt_winter.setText(f"{data.diesel_barnaul:.2f}".replace(".", ","))
 
             warn = ""
-            if getattr(data, "ssl_insecure_used", False):
+            if data.ssl_insecure_used:
                 warn = (
                     "\n\nВнимание: SSL-сертификат не проверился, загрузка выполнена без проверки (verify=False)."
                 )
@@ -166,10 +220,7 @@ class MainWindow(QMainWindow):
                 "Росстат",
                 "Данные загружены:\n"
                 f"Дата формирования: {as_of.strftime('%d.%m.%Y')}\n"
-                f"Дата состояния (выбрана): {data.date_state.strftime('%d.%m.%Y')}\n"
-                f"АИ-92 (Барнаул): {str(data.ai92_barnaul).replace('.', ',')}\n"
-                f"АИ-95 (Барнаул): {str(data.ai95_barnaul).replace('.', ',')}\n"
-                f"ДТ (Барнаул): {str(data.diesel_barnaul).replace('.', ',')}\n"
+                f"Дата состояния: {data.date_state.strftime('%d.%m.%Y')}\n"
                 f"{warn}"
             )
 
@@ -254,11 +305,9 @@ class MainWindow(QMainWindow):
 
             max_price_dec = parse_decimal_ru(self.max_contract_price.text())
 
-            # дата состояния
             qd_state = self.date_state.date()
             date_state_py = dt_date(qd_state.year(), qd_state.month(), qd_state.day())
 
-            # дата формирования (идёт в документ)
             qd_doc = self.date_doc.date()
             doc_date_py = dt_date(qd_doc.year(), qd_doc.month(), qd_doc.day())
 
@@ -324,7 +373,6 @@ class MainWindow(QMainWindow):
                 doc_date=doc_date_py.strftime("%d.%m.%Y"),
             )
 
-            # имя файла по дате формирования
             default_name = f"Обоснование НМЦК от {doc_date_py.strftime('%d.%m.%Y')}.docx"
             path_str, _ = QFileDialog.getSaveFileName(
                 self,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 import io
 import re
 from urllib.parse import urljoin
@@ -88,17 +89,18 @@ def _find_altai_link(doc_soup: BeautifulSoup) -> str | None:
     return hrefs[0]
 
 
-def _get(session: requests.Session, url: str, timeout: int = 30, verify: bool = True) -> requests.Response:
+def _get(session: requests.Session, url: str, timeout: int = 40, verify: bool = True) -> requests.Response:
     r = session.get(url, timeout=timeout, allow_redirects=True, verify=verify)
     r.raise_for_status()
     return r
 
 
-def fetch_latest_prices(as_of: date | None = None) -> RosstatPrices:
+def fetch_latest_prices(as_of: date | None = None, cache_dir: Path | None = None) -> RosstatPrices:
     """
     as_of:
       если задано — берём самую позднюю публикацию, где date_state <= as_of
-      если None — берём самую свежую вообще
+    cache_dir:
+      если задана — кэшируем PDF (по date_state)
     """
     session = requests.Session()
     session.headers.update({
@@ -118,7 +120,7 @@ def fetch_latest_prices(as_of: date | None = None) -> RosstatPrices:
             ssl_insecure_used = True
             return _get(session, url, verify=verify)
 
-    # 1) страница публикаций
+    # 1) публикации
     news_url = urljoin(BASE_URL, "news_stat")
     html = safe_get(news_url).text
     soup = BeautifulSoup(html, "lxml")
@@ -135,7 +137,6 @@ def fetch_latest_prices(as_of: date | None = None) -> RosstatPrices:
             continue
 
         if as_of is not None and d > as_of:
-            # публикация "слишком новая" относительно даты формирования
             continue
 
         candidates.append((d, a["href"]))
@@ -148,12 +149,11 @@ def fetch_latest_prices(as_of: date | None = None) -> RosstatPrices:
             msg += "."
         raise ValueError(msg)
 
-    # 3) самая свежая из подходящих
     candidates.sort(key=lambda x: x[0], reverse=True)
     date_state, href = candidates[0]
     doc_url = urljoin(BASE_URL, href)
 
-    # 4) страница документа
+    # 3) страница документа
     doc_html = safe_get(doc_url).text
     doc_soup = BeautifulSoup(doc_html, "lxml")
 
@@ -163,29 +163,39 @@ def fetch_latest_prices(as_of: date | None = None) -> RosstatPrices:
 
     pdf_url = urljoin(BASE_URL, altai_href)
 
-    # 5) скачиваем PDF
-    resp = safe_get(pdf_url)
-    content = resp.content
-    content_type = (resp.headers.get("Content-Type") or "").lower()
+    # 4) PDF: кэш или скачивание
+    cache_path = None
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"rosstat_{date_state.isoformat()}.pdf"
 
-    if (not _looks_like_pdf(content)) and ("pdf" not in content_type):
-        snippet = content[:400].decode("utf-8", errors="replace")
-        raise ValueError(
-            "Ссылка 'Алтайский край' вернула не PDF.\n"
-            f"URL: {pdf_url}\n"
-            f"Content-Type: {content_type}\n"
-            "Первые символы ответа:\n"
-            f"{snippet}"
-        )
+    if cache_path is not None and cache_path.exists():
+        pdf_bytes = cache_path.read_bytes()
+    else:
+        resp = safe_get(pdf_url)
+        pdf_bytes = resp.content
+        content_type = (resp.headers.get("Content-Type") or "").lower()
 
-    # 6) парсим PDF
+        if (not _looks_like_pdf(pdf_bytes)) and ("pdf" not in content_type):
+            snippet = pdf_bytes[:400].decode("utf-8", errors="replace")
+            raise ValueError(
+                "Ссылка 'Алтайский край' вернула не PDF.\n"
+                f"URL: {pdf_url}\n"
+                f"Content-Type: {content_type}\n"
+                "Первые символы ответа:\n"
+                f"{snippet}"
+            )
+
+        if cache_path is not None:
+            cache_path.write_bytes(pdf_bytes)
+
+    # 5) парсинг PDF
     ai92 = ai95 = diesel = None
-    with pdfplumber.open(io.BytesIO(content)) as pdf:
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
             for line in text.splitlines():
                 line = " ".join(line.split())
-
                 if "Дизельное топливо, л" in line:
                     diesel = _extract_barnaul_value_from_line(line)
                 elif "Бензин автомобильный марки АИ-92, л" in line:
@@ -197,9 +207,7 @@ def fetch_latest_prices(as_of: date | None = None) -> RosstatPrices:
                 break
 
     if ai92 is None or ai95 is None or diesel is None:
-        raise ValueError(
-            "Не удалось извлечь все значения из PDF. Возможно изменился формат PDF."
-        )
+        raise ValueError("Не удалось извлечь все значения из PDF (возможно изменился формат).")
 
     return RosstatPrices(
         date_state=date_state,
