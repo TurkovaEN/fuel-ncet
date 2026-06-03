@@ -3,7 +3,7 @@ from datetime import date as dt_date
 from pathlib import Path
 import shutil
 
-from PySide6.QtCore import QDate
+from PySide6.QtCore import QDate, QObject, QThread, Signal
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTableWidget, QTableWidgetItem, QFormLayout,
@@ -17,6 +17,32 @@ from fuel_ncet.util.app_paths import get_cache_dir
 from fuel_ncet.util.formatting import parse_decimal_ru, fmt_money, fmt_decimal
 from fuel_ncet.util.ru_money import money_to_words
 from fuel_ncet.export.docx_exporter import ExportData, export_docx, MONTHS_RU_NOM
+
+
+class RosstatWorker(QObject):
+    loaded = Signal(object)    # RosstatPrices
+    warning = Signal(str)
+    error = Signal(str)
+    done = Signal()
+
+    def __init__(self, as_of: dt_date, cache_dir: Path):
+        super().__init__()
+        self.as_of = as_of
+        self.cache_dir = cache_dir
+
+    def run(self):
+        try:
+            data = fetch_latest_prices(as_of=self.as_of, cache_dir=self.cache_dir)
+            self.loaded.emit(data)
+            if getattr(data, "ssl_insecure_used", False):
+                self.warning.emit(
+                    "Внимание: SSL-сертификат не проверился, загрузка выполнена без проверки (verify=False)."
+                )
+        except Exception as e:
+            msg = str(e).strip() or repr(e)
+            self.error.emit(msg)
+        finally:
+            self.done.emit()
 
 
 class MainWindow(QMainWindow):
@@ -135,7 +161,17 @@ class MainWindow(QMainWindow):
         self._last_calc_out = None
         self._last_calc_inp = None
 
+        # поток/воркер (чтобы не уничтожились преждевременно)
+        self._rosstat_thread: QThread | None = None
+        self._rosstat_worker: RosstatWorker | None = None
+        self._rosstat_warnings: list[str] = []
+
     def closeEvent(self, event):
+        # если загрузка идёт — корректно останавливаем и ждём
+        if self._rosstat_thread is not None and self._rosstat_thread.isRunning():
+            self._rosstat_thread.quit()
+            self._rosstat_thread.wait(5000)
+
         # удаляем кэш при выходе (если включено)
         if self.chk_clear_cache.isChecked():
             try:
@@ -143,7 +179,19 @@ class MainWindow(QMainWindow):
                     shutil.rmtree(self.cache_dir, ignore_errors=True)
             except Exception:
                 pass
+
         super().closeEvent(event)
+
+    def _set_busy(self, busy: bool):
+        self.btn_fetch.setEnabled(not busy)
+        self.btn_reset.setEnabled(not busy)
+        self.btn_calc.setEnabled(not busy)
+        self.btn_export.setEnabled(not busy)
+
+        if busy:
+            self.btn_fetch.setText("Загрузка...")
+        else:
+            self.btn_fetch.setText("Загрузить с Росстата (по дате формирования)")
 
     def _fill_static_rows(self):
         self.table.clearContents()
@@ -167,12 +215,10 @@ class MainWindow(QMainWindow):
         self.table.setItem(total_row, 0, QTableWidgetItem("Итого"))
 
     def on_reset(self):
-        # Даты: как в “стартовом” состоянии
         today = QDate.currentDate()
         self.date_doc.setDate(today)
         self.date_state.setDate(today)
 
-        # Поля: очистить
         self.price_ai92.clear()
         self.price_ai95.clear()
         self.price_dt_summer.clear()
@@ -180,56 +226,80 @@ class MainWindow(QMainWindow):
         self.inflation_percent.clear()
         self.max_contract_price.clear()
 
-        # Степени: сброс
         self.manual_degrees.setChecked(False)
         self.n_start.setValue(0)
         self.n_end.setValue(0)
 
-        # Таблица: очистить рассчитанные колонки
         self._fill_static_rows()
 
-        # Сброс последнего расчёта
         self._last_calc_out = None
         self._last_calc_inp = None
 
+    # ---------------------- ROSSTAT (в фоне) ----------------------
     def on_fetch_rosstat(self):
-        try:
-            self.btn_fetch.setEnabled(False)
-            self.btn_fetch.setText("Загрузка...")
+        # если поток уже идёт — повторно не запускаем
+        if self._rosstat_thread is not None and self._rosstat_thread.isRunning():
+            return
 
-            qd = self.date_doc.date()
-            as_of = dt_date(qd.year(), qd.month(), qd.day())
+        self._rosstat_warnings = []
 
-            data = fetch_latest_prices(as_of=as_of, cache_dir=self.cache_dir)
+        qd = self.date_doc.date()
+        as_of = dt_date(qd.year(), qd.month(), qd.day())
 
-            self.date_state.setDate(QDate(data.date_state.year, data.date_state.month, data.date_state.day))
+        self._set_busy(True)
 
-            self.price_ai92.setText(f"{data.ai92_barnaul:.2f}".replace(".", ","))
-            self.price_ai95.setText(f"{data.ai95_barnaul:.2f}".replace(".", ","))
-            self.price_dt_summer.setText(f"{data.diesel_barnaul:.2f}".replace(".", ","))
-            self.price_dt_winter.setText(f"{data.diesel_barnaul:.2f}".replace(".", ","))
+        self._rosstat_thread = QThread(self)  # parent=self -> поток не "потеряется"
+        self._rosstat_worker = RosstatWorker(as_of=as_of, cache_dir=self.cache_dir)
+        self._rosstat_worker.moveToThread(self._rosstat_thread)
 
-            warn = ""
-            if data.ssl_insecure_used:
-                warn = (
-                    "\n\nВнимание: SSL-сертификат не проверился, загрузка выполнена без проверки (verify=False)."
-                )
+        self._rosstat_thread.started.connect(self._rosstat_worker.run)
 
-            QMessageBox.information(
-                self,
-                "Росстат",
-                "Данные загружены:\n"
-                f"Дата формирования: {as_of.strftime('%d.%m.%Y')}\n"
-                f"Дата состояния: {data.date_state.strftime('%d.%m.%Y')}\n"
-                f"{warn}"
-            )
+        self._rosstat_worker.loaded.connect(self._on_rosstat_loaded)
+        self._rosstat_worker.warning.connect(self._on_rosstat_warning)
+        self._rosstat_worker.error.connect(self._on_rosstat_error)
 
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка загрузки", str(e))
-        finally:
-            self.btn_fetch.setEnabled(True)
-            self.btn_fetch.setText("Загрузить с Росстата (по дате формирования)")
+        # worker done -> quit thread
+        self._rosstat_worker.done.connect(self._rosstat_thread.quit)
 
+        # cleanup
+        self._rosstat_thread.finished.connect(self._on_rosstat_finished)
+
+        self._rosstat_thread.start()
+
+    def _on_rosstat_loaded(self, data):
+        self.date_state.setDate(QDate(data.date_state.year, data.date_state.month, data.date_state.day))
+        self.price_ai92.setText(f"{data.ai92_barnaul:.2f}".replace(".", ","))
+        self.price_ai95.setText(f"{data.ai95_barnaul:.2f}".replace(".", ","))
+        self.price_dt_summer.setText(f"{data.diesel_barnaul:.2f}".replace(".", ","))
+        self.price_dt_winter.setText(f"{data.diesel_barnaul:.2f}".replace(".", ","))
+
+    def _on_rosstat_warning(self, msg: str):
+        m = (msg or "").strip()
+        if m:
+            self._rosstat_warnings.append(m)
+
+    def _on_rosstat_error(self, msg: str):
+        QMessageBox.critical(self, "Ошибка загрузки Росстата", msg)
+
+    def _on_rosstat_finished(self):
+        self._set_busy(False)
+
+        # показать предупреждения (если были)
+        if self._rosstat_warnings:
+            text = "\n".join(f"- {w}" for w in self._rosstat_warnings)
+            QMessageBox.warning(self, "Предупреждение", text)
+            self._rosstat_warnings = []
+
+        # освобождаем ссылки
+        if self._rosstat_worker is not None:
+            self._rosstat_worker.deleteLater()
+        if self._rosstat_thread is not None:
+            self._rosstat_thread.deleteLater()
+
+        self._rosstat_worker = None
+        self._rosstat_thread = None
+
+    # ---------------------- CALC / EXPORT ----------------------
     def on_calc(self):
         try:
             if not self.price_dt_winter.text().strip() and self.price_dt_summer.text().strip():
