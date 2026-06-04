@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from typing import Optional, List, Tuple
 import io
 import re
 from urllib.parse import urljoin
@@ -46,7 +47,7 @@ _MONTHS_RU = {
 }
 
 
-def _parse_date_from_title(text: str) -> date | None:
+def _parse_date_from_title(text: str) -> Optional[date]:
     t = " ".join(text.split())
     m = re.search(r"на\s+(\d{1,2})\s+([а-яё]+)\s+(\d{4})\s+года", t, re.IGNORECASE)
     if not m:
@@ -63,7 +64,7 @@ def _parse_date_from_title(text: str) -> date | None:
 def _extract_barnaul_value_from_line(line: str) -> float:
     nums = re.findall(r"\d+,\d+", line)
     if len(nums) < 2:
-        raise ValueError(f"Не удалось найти значение Барнаула в строке: {line}")
+        raise ValueError("Не удалось найти значение Барнаула в строке: %s" % line)
     return float(nums[1].replace(",", "."))
 
 
@@ -71,8 +72,8 @@ def _looks_like_pdf(data: bytes) -> bool:
     return data[:5] == b"%PDF-"
 
 
-def _find_altai_link(doc_soup: BeautifulSoup) -> str | None:
-    hrefs: list[str] = []
+def _find_altai_link(doc_soup: BeautifulSoup) -> Optional[str]:
+    hrefs = []
     for a in doc_soup.find_all("a", href=True):
         t = (a.get_text() or "").strip()
         if t == "Алтайский край":
@@ -95,13 +96,7 @@ def _get(session: requests.Session, url: str, timeout: int = 40, verify: bool = 
     return r
 
 
-def fetch_latest_prices(as_of: date | None = None, cache_dir: Path | None = None) -> RosstatPrices:
-    """
-    as_of:
-      если задано — берём самую позднюю публикацию, где date_state <= as_of
-    cache_dir:
-      если задана — кэшируем PDF (по date_state)
-    """
+def fetch_latest_prices(as_of: Optional[date] = None, cache_dir: Optional[Path] = None) -> RosstatPrices:
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FuelNCET/1.0",
@@ -120,40 +115,31 @@ def fetch_latest_prices(as_of: date | None = None, cache_dir: Path | None = None
             ssl_insecure_used = True
             return _get(session, url, verify=verify)
 
-    # 1) публикации
     news_url = urljoin(BASE_URL, "news_stat")
     html = safe_get(news_url).text
     soup = BeautifulSoup(html, "lxml")
 
-    # 2) кандидаты
-    candidates: list[tuple[date, str]] = []
+    candidates = []  # type: List[Tuple[date, str]]
     for a in soup.find_all("a", href=True):
         text = (a.get_text() or "").strip()
         if "Потребительские цены на" not in text:
             continue
-
         d = _parse_date_from_title(text)
         if not d:
             continue
-
         if as_of is not None and d > as_of:
             continue
-
         candidates.append((d, a["href"]))
 
     if not candidates:
-        msg = "Не найдены подходящие публикации 'Потребительские цены на ...'"
         if as_of is not None:
-            msg += f" не позже {as_of.strftime('%d.%m.%Y')}."
-        else:
-            msg += "."
-        raise ValueError(msg)
+            raise ValueError("Не найдены публикации Росстата не позже %s." % as_of.strftime("%d.%m.%Y"))
+        raise ValueError("Не найдены публикации Росстата.")
 
     candidates.sort(key=lambda x: x[0], reverse=True)
     date_state, href = candidates[0]
     doc_url = urljoin(BASE_URL, href)
 
-    # 3) страница документа
     doc_html = safe_get(doc_url).text
     doc_soup = BeautifulSoup(doc_html, "lxml")
 
@@ -163,11 +149,10 @@ def fetch_latest_prices(as_of: date | None = None, cache_dir: Path | None = None
 
     pdf_url = urljoin(BASE_URL, altai_href)
 
-    # 4) PDF: кэш или скачивание
     cache_path = None
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = cache_dir / f"rosstat_{date_state.isoformat()}.pdf"
+        cache_path = cache_dir / ("rosstat_%s.pdf" % date_state.isoformat())
 
     if cache_path is not None and cache_path.exists():
         pdf_bytes = cache_path.read_bytes()
@@ -178,19 +163,13 @@ def fetch_latest_prices(as_of: date | None = None, cache_dir: Path | None = None
 
         if (not _looks_like_pdf(pdf_bytes)) and ("pdf" not in content_type):
             snippet = pdf_bytes[:400].decode("utf-8", errors="replace")
-            raise ValueError(
-                "Ссылка 'Алтайский край' вернула не PDF.\n"
-                f"URL: {pdf_url}\n"
-                f"Content-Type: {content_type}\n"
-                "Первые символы ответа:\n"
-                f"{snippet}"
-            )
+            raise ValueError("Ссылка вернула не PDF. Первые символы:\n%s" % snippet)
 
         if cache_path is not None:
             cache_path.write_bytes(pdf_bytes)
 
-    # 5) парсинг PDF
     ai92 = ai95 = diesel = None
+
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
@@ -207,7 +186,7 @@ def fetch_latest_prices(as_of: date | None = None, cache_dir: Path | None = None
                 break
 
     if ai92 is None or ai95 is None or diesel is None:
-        raise ValueError("Не удалось извлечь все значения из PDF (возможно изменился формат).")
+        raise ValueError("Не удалось извлечь значения из PDF.")
 
     return RosstatPrices(
         date_state=date_state,

@@ -1,25 +1,34 @@
+import os
 import sys
+from pathlib import Path
 
-from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication
+import PySide2
+from PySide2.QtGui import QIcon
+from PySide2.QtWidgets import QApplication
 
 from fuel_ncet.gui.main_window import MainWindow
 from fuel_ncet.util.resources import resource_path
 
 
 def _set_windows_app_id():
-    """Чтобы в панели задач была иконка приложения, а не python.exe (Windows)."""
     if sys.platform.startswith("win"):
         try:
             import ctypes
-            app_id = "fuel-ncet.app"  # можно любое уникальное строковое значение
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("fuel-ncet.legacy")
         except Exception:
             pass
 
 
+def _fix_qt_plugin_path():
+    pyside_dir = Path(PySide2.__file__).resolve().parent
+    plugins_dir = pyside_dir / "plugins"
+    os.environ["QT_PLUGIN_PATH"] = str(plugins_dir)
+    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(plugins_dir / "platforms")
+
+
 def run():
     _set_windows_app_id()
+    _fix_qt_plugin_path()
 
     app = QApplication([])
 
@@ -27,8 +36,7 @@ def run():
     app.setWindowIcon(QIcon(str(icon_path)))
 
     w = MainWindow()
-    # на всякий случай задаём и окну тоже
     w.setWindowIcon(QIcon(str(icon_path)))
-
     w.show()
-    app.exec()
+
+    app.exec_()

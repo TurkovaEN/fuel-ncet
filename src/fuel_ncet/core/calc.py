@@ -1,11 +1,12 @@
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
+from typing import Tuple
 
 
 @dataclass
 class CalcInput:
-    base_month: int                 # месяц даты состояния (1..12)
-    inflation_year_factor: Decimal  # например 1.040 для 104,0%
+    base_month: int
+    inflation_year_factor: Decimal
     price_ai92: Decimal
     price_ai95: Decimal
     price_dt_summer: Decimal
@@ -35,23 +36,16 @@ def _round(d: Decimal, places: int) -> Decimal:
     return d.quantize(q, rounding=ROUND_HALF_UP)
 
 
-def compute_degrees_by_rule(base_month: int) -> tuple[int, int]:
-    # base_month < 6 -> до июля/декабря
-    # base_month > 9 -> до января/июня следующего года
-    if base_month < 6:
+def compute_degrees_by_rule(base_month: int) -> Tuple[int, int]:
+    # если базовый месяц январь–июнь -> июль–декабрь текущего года
+    if base_month <= 6:
         return 7 - base_month, 12 - base_month
-    if base_month > 9:
-        return (12 - base_month) + 1, (12 - base_month) + 6
 
-    raise ValueError(
-        "Для базового месяца июнь–сентябрь степени нужно задать вручную "
-        "(включите 'Править степени вручную')."
-    )
+    # если базовый месяц июль–декабрь -> январь–июнь следующего года
+    return (12 - base_month) + 1, (12 - base_month) + 6
 
 
 def calc(inp: CalcInput) -> CalcOutput:
-    # Ежемесячный индекс: m = factor^(1/12)
-    # ВАЖНО: округляем m до 4 знаков ДО возведения в степень (как в вашем прежнем варианте)
     factor_f = float(inp.inflation_year_factor)
     m = Decimal(str(factor_f ** (1.0 / 12.0)))
     m = _round(m, 4)
