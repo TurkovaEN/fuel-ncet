@@ -12,10 +12,9 @@ import pdfplumber
 import requests
 from requests.exceptions import SSLError
 from bs4 import BeautifulSoup
-
 import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_URL = "https://22.rosstat.gov.ru/"
 
@@ -78,15 +77,12 @@ def _find_altai_link(doc_soup: BeautifulSoup) -> Optional[str]:
         t = (a.get_text() or "").strip()
         if t == "Алтайский край":
             hrefs.append(a["href"])
-
     if not hrefs:
         return None
-
     for h in hrefs:
         hl = h.lower()
         if ".pdf" in hl or "download" in hl or "/system/files" in hl:
             return h
-
     return hrefs[0]
 
 
@@ -96,12 +92,33 @@ def _get(session: requests.Session, url: str, timeout: int = 40, verify: bool = 
     return r
 
 
+def _find_next_page_href(soup: BeautifulSoup) -> Optional[str]:
+    for a in soup.find_all("a", href=True):
+        txt = " ".join((a.get_text() or "").split())
+        if txt == "Далее":
+            return a["href"]
+    for a in soup.find_all("a", href=True):
+        rel = a.get("rel") or []
+        if isinstance(rel, str):
+            rel = [rel]
+        rel = [str(x).lower() for x in rel]
+        if "next" in rel:
+            return a["href"]
+    for a in soup.find_all("a", href=True):
+        txt = " ".join((a.get_text() or "").split())
+        if txt in ("»", "›", ">"):
+            return a["href"]
+    return None
+
+
 def fetch_latest_prices(as_of: Optional[date] = None, cache_dir: Optional[Path] = None) -> RosstatPrices:
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FuelNCET/1.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    })
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FuelNCET/1.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+    )
 
     verify = True
     ssl_insecure_used = False
@@ -116,20 +133,44 @@ def fetch_latest_prices(as_of: Optional[date] = None, cache_dir: Optional[Path] 
             return _get(session, url, verify=verify)
 
     news_url = urljoin(BASE_URL, "news_stat")
-    html = safe_get(news_url).text
-    soup = BeautifulSoup(html, "lxml")
+    page_url = news_url
 
-    candidates = []  # type: List[Tuple[date, str]]
-    for a in soup.find_all("a", href=True):
-        text = (a.get_text() or "").strip()
-        if "Потребительские цены на" not in text:
-            continue
-        d = _parse_date_from_title(text)
-        if not d:
-            continue
-        if as_of is not None and d > as_of:
-            continue
-        candidates.append((d, a["href"]))
+    candidates: List[Tuple[date, str]] = []
+    visited = set()
+    max_pages = 200
+
+    for _ in range(max_pages):
+        if page_url in visited:
+            break
+        visited.add(page_url)
+
+        html = safe_get(page_url).text
+        soup = BeautifulSoup(html, "lxml")
+
+        page_candidates: List[Tuple[date, str]] = []
+        for a in soup.find_all("a", href=True):
+            text = (a.get_text() or "").strip()
+            if "Потребительские цены на" not in text:
+                continue
+            d = _parse_date_from_title(text)
+            if not d:
+                continue
+            if as_of is not None and d > as_of:
+                continue
+            page_candidates.append((d, a["href"]))
+
+        if as_of is None:
+            candidates = page_candidates
+            break
+
+        if page_candidates:
+            candidates = page_candidates
+            break
+
+        next_href = _find_next_page_href(soup)
+        if not next_href:
+            break
+        page_url = urljoin(BASE_URL, next_href)
 
     if not candidates:
         if as_of is not None:
@@ -138,8 +179,8 @@ def fetch_latest_prices(as_of: Optional[date] = None, cache_dir: Optional[Path] 
 
     candidates.sort(key=lambda x: x[0], reverse=True)
     date_state, href = candidates[0]
-    doc_url = urljoin(BASE_URL, href)
 
+    doc_url = urljoin(BASE_URL, href)
     doc_html = safe_get(doc_url).text
     doc_soup = BeautifulSoup(doc_html, "lxml")
 
@@ -160,15 +201,15 @@ def fetch_latest_prices(as_of: Optional[date] = None, cache_dir: Optional[Path] 
         resp = safe_get(pdf_url)
         pdf_bytes = resp.content
         content_type = (resp.headers.get("Content-Type") or "").lower()
-
         if (not _looks_like_pdf(pdf_bytes)) and ("pdf" not in content_type):
             snippet = pdf_bytes[:400].decode("utf-8", errors="replace")
             raise ValueError("Ссылка вернула не PDF. Первые символы:\n%s" % snippet)
-
         if cache_path is not None:
             cache_path.write_bytes(pdf_bytes)
 
-    ai92 = ai95 = diesel = None
+    ai92 = None
+    ai95 = None
+    diesel = None
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
@@ -181,7 +222,6 @@ def fetch_latest_prices(as_of: Optional[date] = None, cache_dir: Optional[Path] 
                     ai92 = _extract_barnaul_value_from_line(line)
                 elif "Бензин автомобильный марки АИ-95, л" in line:
                     ai95 = _extract_barnaul_value_from_line(line)
-
             if ai92 is not None and ai95 is not None and diesel is not None:
                 break
 
